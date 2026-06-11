@@ -8,6 +8,8 @@ namespace BettingService.Tests.Tests;
 public class MarketSuspensionTests : PlaywrightTest
 {
     private IAPIRequestContext _api = null!;
+    protected ApiHelpers Api;
+    private string _userId = null!;
     private readonly string _baseUrl = "http://localhost:5000";
 
     [SetUp]
@@ -17,6 +19,11 @@ public class MarketSuspensionTests : PlaywrightTest
         {
             BaseURL = _baseUrl
         });
+        Api = new ApiHelpers(_api);
+
+        //Create user
+        var name = $"user_{Guid.NewGuid():N}";
+        _userId = await Api.CreateUserAsync(name: name, balance: 100.00m);
     }
 
     [TearDown]
@@ -28,32 +35,18 @@ public class MarketSuspensionTests : PlaywrightTest
     [Test]
     public async Task Suspended_Market_Rejects_New_Bets()
     {
-        // Arrange: create user
-        var userResponse = await _api.PostAsync("/api/users", new()
-        {
-            DataObject = new { name = $"user_{Guid.NewGuid():N}", balance = 100.00m }
-        });
-        var user = await userResponse.JsonAsync();
-        var userId = user.Value.GetProperty("id").GetString();
+        var userId = _userId;
+        var selectionName = "Team A";
+        var odds = 2.50m;
+        var stake = 10.00m;
 
         // Arrange: create market
-        var eventId = Guid.NewGuid();
-        var marketResponse = await _api.PostAsync("/api/markets", new()
-        {
-            DataObject = new
-            {
-                name = "Match Winner",
-                eventId,
-                eventName = "Test Match",
-                selections = new[] { new { name = "Team A", odds = 2.50 } }
-            }
-        });
-        var market = await marketResponse.JsonAsync();
-        var marketId = market.Value.GetProperty("id").GetString();
-        var selectionId = market.Value.GetProperty("selections")[0].GetProperty("id").GetString();
+        var IdsArray = await Api.CreateMarketIdAndSelectionIdWtihSingleSelection(selectionName: selectionName, odds: odds);
+        var marketId = IdsArray[0];
+        var selectionId = IdsArray[1];
 
         // Act: suspend the market
-        await _api.PostAsync($"/api/markets/{marketId}/suspend", new() { });
+        await Api.SuspendMarket(marketId: marketId);
 
         // Wait until market is actually suspended (async propagation)
         var isSuspended = await PollUntilAsync(async () =>
@@ -63,22 +56,18 @@ public class MarketSuspensionTests : PlaywrightTest
             return data.Value.GetProperty("state").GetString() == "Suspended";
         }, timeoutMs: 5000);
 
-        Assert.That(isSuspended, Is.True, "Market should transition to Suspended state");
+        var marketStatus = await Api.GetMarketStatus(marketId: marketId);
+        Assert.That(marketStatus.Equals("Suspended"));
 
         // Act: attempt to place a bet on suspended market
-        var betResponse = await _api.PostAsync($"/api/users/{userId}/bets", new()
-        {
-            DataObject = new { selectionId, stake = 10.00m }
-        });
-
+        var betResponse = await Api.PlaceSingleBet(userId: userId, selectionId: selectionId, stake: stake);
+        
         // Assert: bet should be rejected
         Assert.That(betResponse.Status, Is.EqualTo(409));
 
-        // Assert: balance unchanged
-        var balanceResponse = await _api.GetAsync($"/api/users/{userId}/balance");
-        var balance = await balanceResponse.JsonAsync();
-        Assert.That(balance.Value.GetProperty("amount").GetDecimal(), Is.EqualTo(100.00m));
-    }
+        //Assert user balance is still 100.00
+        var userBalance = await Api.GetUserBalance(userId: userId);
+        Assert.That(userBalance.Equals(100.00m));    }
 
     private static async Task<bool> PollUntilAsync(Func<Task<bool>> condition, int timeoutMs, int intervalMs = 250)
     {

@@ -8,6 +8,8 @@ namespace BettingService.Tests.Tests;
 public class SettlementTests : PlaywrightTest
 {
     private IAPIRequestContext _api = null!;
+    protected ApiHelpers Api;
+    private string _userId = null!;
     private readonly string _baseUrl = "http://localhost:5000";
 
     [SetUp]
@@ -17,6 +19,11 @@ public class SettlementTests : PlaywrightTest
         {
             BaseURL = _baseUrl
         });
+        Api = new ApiHelpers(_api);
+
+        //Create user
+        var name = $"user_{Guid.NewGuid():N}";
+        _userId = await Api.CreateUserAsync(name: name, balance: 100.00m);
     }
 
     [TearDown]
@@ -28,39 +35,16 @@ public class SettlementTests : PlaywrightTest
     [Test]
     public async Task Settlement_Pays_Winning_Bet_Correctly()
     {
-        // Arrange: create user
-        var userResponse = await _api.PostAsync("/api/users", new()
-        {
-            DataObject = new { name = $"user_{Guid.NewGuid():N}", balance = 100.00m }
-        });
-        var user = await userResponse.JsonAsync();
-        var userId = user.Value.GetProperty("id").GetString();
-
-        // Arrange: create market with known odds
-        var eventId = Guid.NewGuid();
-        var marketResponse = await _api.PostAsync("/api/markets", new()
-        {
-            DataObject = new
-            {
-                name = "Match Winner",
-                eventId,
-                eventName = "Test Match",
-                selections = new[]
-                {
-                    new { name = "Team A", odds = 2.50 },
-                    new { name = "Team B", odds = 1.80 }
-                }
-            }
-        });
-        var market = await marketResponse.JsonAsync();
-        var winningSelectionId = market.Value.GetProperty("selections")[0].GetProperty("id").GetString();
+        var userId = _userId;
+        var selectionName = "Team A";
+        var odds = 2.50m;
+         // Arrange: create market
+        var IdsArray = await Api.CreateMarketIdAndSelectionIdWtihSingleSelection(selectionName: selectionName, odds: odds);
+        var winningSelectionId = IdsArray[1];
+        var eventId = IdsArray[2];
 
         // Arrange: place bet and wait for it to become Active
-        await _api.PostAsync($"/api/users/{userId}/bets", new()
-        {
-            DataObject = new { selectionId = winningSelectionId, stake = 10.00m }
-        });
-
+        await Api.PlaceSingleBet(userId: userId, selectionId: winningSelectionId, stake: 10.00m);
         var betActive = await PollUntilAsync(async () =>
         {
             var bets = await _api.GetAsync($"/api/users/{userId}/bets");
@@ -70,11 +54,8 @@ public class SettlementTests : PlaywrightTest
         Assert.That(betActive, Is.True, "Bet must be Active before settlement");
 
         // Act: post result — Team A wins
-        var resultResponse = await _api.PostAsync($"/api/events/{eventId}/result", new()
-        {
-            DataObject = new { winningSelectionId }
-        });
-        Assert.That(resultResponse.Status, Is.EqualTo(200));
+        var resultResponse = Api.SettleBet(eventId: eventId, winningSelectionId: winningSelectionId);
+
 
         // Assert: poll until bet is settled as Won with correct payout
         var settled = await PollUntilAsync(async () =>
@@ -88,7 +69,7 @@ public class SettlementTests : PlaywrightTest
 
         Assert.That(settled, Is.True, "Bet should settle as Won with payout = stake × odds");
 
-        // Assert: balance = original - stake + payout = 100 - 10 + 25 = 115
+        // Assert: balance updated
         var balanceResponse = await _api.GetAsync($"/api/users/{userId}/balance");
         var balance = await balanceResponse.JsonAsync();
         Assert.That(balance.Value.GetProperty("amount").GetDecimal(), Is.EqualTo(115.00m));
